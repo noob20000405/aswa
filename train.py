@@ -59,6 +59,12 @@ parser.add_argument('--crit_fraction', type=float, default=0.5,
 parser.add_argument('--snapshot_stride', type=int, default=1,
                     help='keep every n-th SWA snapshot during SWA stage (>=1); only used if --do_func_ens')
 
+parser.add_argument('--func_w_l2', type=float, default=0.0,
+                    help='L2 regularization coeff λ for α-learning (towards uniform). Default 0 keeps old behavior.')
+parser.add_argument('--func_w_eta', type=float, default=0.0,
+                    help='Correlation (quadratic) coeff η for α-learning. Default 0 keeps old behavior.')
+
+
 args = parser.parse_args()
 
 print('Preparing directory %s' % args.dir)
@@ -387,57 +393,117 @@ def _cache_val_probs_or_logprobs(snapshots, loader, build_model_fn, want_log=Fal
         torch.cuda.empty_cache()
     return outs
 
-def _learn_alpha_on_val_linear(snapshots, loader_val, build_model_fn, steps=150, lr=0.3, S_idx=None):
-    labels=[]
+def _build_M_from_true_probs(P_list, y):
+    """
+    P_list: list of length K, each [N,C] prob on val for snapshot k
+    y: numpy [N] true labels
+    Return: M [K,K] (float64, PSD) built from centered true-class prob matrix F (K×N)
+    """
+    K = len(P_list)
+    # F[k, n] = P_k(n, y_n)
+    F = np.stack([Pi[np.arange(y.size), y] for Pi in P_list], axis=0).astype(np.float64)  # [K,N]
+    F = F - F.mean(axis=1, keepdims=True)  # center each row
+    N = max(1, F.shape[1])
+    M = (F @ F.T) / float(N)               # covariance-like, PSD
+    # 数值稳健：trace 归一到 K（可不做；保持量级稳定）
+    tr = np.trace(M)
+    if np.isfinite(tr) and tr > 1e-12:
+        M = M * (K / tr)
+    return M
+
+
+def _learn_alpha_on_val_linear(snapshots, loader_val, build_model_fn, device_, steps=150, lr=0.3, S_idx=None):
+    # 收集标签
+    labels=[]; 
     for _, y in loader_val: labels.append(y.numpy())
     y = np.concatenate(labels, axis=0).astype(np.int64)
-    P_list = _cache_val_probs_or_logprobs(snapshots, loader_val, build_model_fn, want_log=False)
-    K = len(P_list); P = np.stack(P_list, axis=0).astype(np.float32)  # [K,N,C]
-    phi = torch.zeros(K, dtype=torch.float32, requires_grad=True)
+
+    # 预缓存各模型在 val 上的概率
+    P_list = _cache_val_probs_or_logprobs(snapshots, loader_val, build_model_fn, device_, want_log=False)  # list of [N,C]
+    K, N, C = len(P_list), P_list[0].shape[0], P_list[0].shape[1]
+    P = np.stack(P_list, axis=0)  # [K,N,C]
+
+    # 相关性矩阵 M（K×K），以及均匀向量 u
+    M_np = _build_M_from_true_probs(P_list, y)             # [K,K]
+    u_np = np.ones(K, dtype=np.float64) / float(max(1, K))
+
+    phi = torch.zeros(K, dtype=torch.float64, requires_grad=True)
     opt = torch.optim.Adam([phi], lr=lr)
-    y_t = torch.from_numpy(y).long()
-    P_t = torch.from_numpy(P)  # float32
+    y_t  = torch.from_numpy(y).long()
+    P_t  = torch.from_numpy(P).to(torch.float64)
     idx_t = torch.from_numpy(S_idx).long() if S_idx is not None else None
+    M_t  = torch.from_numpy(M_np).to(torch.float64)
+    u_t  = torch.from_numpy(u_np).to(torch.float64)
+
+    lam = float(args.func_w_l2)
+    eta = float(args.func_w_eta)
+
     for _ in range(1, steps+1):
         opt.zero_grad()
-        w = torch.softmax(phi, dim=0)
-        mix = torch.einsum('k,knc->nc', w, P_t)  # [N,C]
+        w = torch.softmax(phi, dim=0)                      # [K]
+        mix = torch.einsum('k,knc->nc', w, P_t)            # [N,C]
         if idx_t is not None:
             mix_sel = mix.index_select(0, idx_t)
             y_sel   = y_t.index_select(0, idx_t)
-            loss = F.nll_loss(torch.log(mix_sel.clamp_min(1e-12)), y_sel)
+            ce = F.nll_loss(torch.log(mix_sel.clamp_min_(1e-12)), y_sel)
         else:
-            loss = F.nll_loss(torch.log(mix.clamp_min(1e-12)), y_t)
+            ce = F.nll_loss(torch.log(mix.clamp_min_(1e-12)), y_t)
+
+        reg_l2 = lam * torch.sum((w - u_t) * (w - u_t))
+        quad   = eta * torch.sum(w * (M_t @ w))
+        loss = ce + reg_l2 + quad
         loss.backward(); opt.step()
+
     with torch.no_grad():
         w = torch.softmax(phi, dim=0).cpu().numpy()
     return w
 
-def _learn_alpha_on_val_logpool(snapshots, loader_val, build_model_fn, steps=150, lr=0.3, S_idx=None):
+def _learn_alpha_on_val_logpool(snapshots, loader_val, build_model_fn, device_, steps=150, lr=0.3, S_idx=None):
     labels=[]
     for _, y in loader_val: labels.append(y.numpy())
     y = np.concatenate(labels, axis=0).astype(np.int64)
-    L_list = _cache_val_probs_or_logprobs(snapshots, loader_val, build_model_fn, want_log=True)
-    K = len(L_list); L = np.stack(L_list, axis=0).astype(np.float32)  # [K,N,C]
-    phi = torch.zeros(K, dtype=torch.float32, requires_grad=True)
+
+    L_list = _cache_val_probs_or_logprobs(snapshots, loader_val, build_model_fn, device_, want_log=True)  # list of [N,C]
+    K, N, C = len(L_list), L_list[0].shape[0], L_list[0].shape[1]
+    L = np.stack(L_list, axis=0)  # [K,N,C]
+
+    # 对 logpool 也用同样的 M（基于概率构的更稳定）
+    # 需要概率来算 M，所以重新拿一次概率（或在外部传进来，这里直接复用 cache）
+    P_list = _cache_val_probs_or_logprobs(snapshots, loader_val, build_model_fn, device_, want_log=False)
+    M_np = _build_M_from_true_probs(P_list, y)
+    u_np = np.ones(K, dtype=np.float64) / float(max(1, K))
+
+    phi = torch.zeros(K, dtype=torch.float64, requires_grad=True)
     opt = torch.optim.Adam([phi], lr=lr)
-    y_t = torch.from_numpy(y).long()
-    L_t = torch.from_numpy(L)  # float32
+    y_t  = torch.from_numpy(y).long()
+    L_t  = torch.from_numpy(L).to(torch.float64)      # [K,N,C]
     idx_t = torch.from_numpy(S_idx).long() if S_idx is not None else None
+    M_t  = torch.from_numpy(M_np).to(torch.float64)
+    u_t  = torch.from_numpy(u_np).to(torch.float64)
+
+    lam = float(args.func_w_l2)
+    eta = float(args.func_w_eta)
+
     for _ in range(1, steps+1):
         opt.zero_grad()
-        w = torch.softmax(phi, dim=0)
-        log_mix = torch.einsum('k,knc->nc', w, L_t)  # [N,C]
+        w = torch.softmax(phi, dim=0)                 # [K]
+        log_mix = torch.einsum('k,knc->nc', w, L_t)   # [N,C]
         if idx_t is not None:
             log_sel = log_mix.index_select(0, idx_t)
             y_sel   = y_t.index_select(0, idx_t)
-            loss = F.nll_loss(torch.log_softmax(log_sel, dim=1), y_sel)
+            ce = F.nll_loss(torch.log_softmax(log_sel, dim=1), y_sel)
         else:
-            loss = F.nll_loss(torch.log_softmax(log_mix, dim=1), y_t)
+            ce = F.nll_loss(torch.log_softmax(log_mix, dim=1), y_t)
+
+        reg_l2 = lam * torch.sum((w - u_t) * (w - u_t))
+        quad   = eta * torch.sum(w * (M_t @ w))
+        loss = ce + reg_l2 + quad
         loss.backward(); opt.step()
+
     with torch.no_grad():
         w = torch.softmax(phi, dim=0).cpu().numpy()
     return w
+
 
 def _load_or_uniform_weights(K):
     w = None
