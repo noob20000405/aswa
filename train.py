@@ -412,7 +412,9 @@ def _build_M_from_true_probs(P_list, y):
     return M
 
 
-def _learn_alpha_on_val_linear(snapshots, loader_val, build_model_fn, device_, steps=150, lr=0.3, S_idx=None):
+def _learn_alpha_on_val_linear(snapshots, loader_val, build_model_fn, steps=150, lr=0.3, S_idx=None):
+    device_ = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+  
     # 收集标签
     labels=[]; 
     for _, y in loader_val: labels.append(y.numpy())
@@ -458,7 +460,9 @@ def _learn_alpha_on_val_linear(snapshots, loader_val, build_model_fn, device_, s
         w = torch.softmax(phi, dim=0).cpu().numpy()
     return w
 
-def _learn_alpha_on_val_logpool(snapshots, loader_val, build_model_fn, device_, steps=150, lr=0.3, S_idx=None):
+def _learn_alpha_on_val_logpool(snapshots, loader_val, build_model_fn, steps=150, lr=0.3, S_idx=None):
+    device_ = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+  
     labels=[]
     for _, y in loader_val: labels.append(y.numpy())
     y = np.concatenate(labels, axis=0).astype(np.int64)
