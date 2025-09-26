@@ -700,7 +700,7 @@ def _eval_function_ensemble(snapshots, weights, loader, build_model_fn, mode='li
 if args.do_func_ens and len(swa_snapshots) > 0:
     # 基于 SWA（若启用，否则用 running）在 val 上选 critical 子集
     ref_for_margin = swa_model if args.swa else model
-    S_idx = _build_crit_subset_indices(ref_for_margin, val_noaug_loader, device, args.crit_fraction)
+    S_idx = _build_crit_subset_indices(ref_for_margin, val_noaug_loader, args.crit_fraction)
 
     if S_idx is None:
         print(f"[α-learn] Using FULL val set (crit_fraction={args.crit_fraction:.2f} ignored).")
