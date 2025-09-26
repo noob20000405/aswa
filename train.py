@@ -12,6 +12,7 @@ import utils
 import tabulate
 from torch.utils.data import random_split
 import pandas as pd
+import numpy as np
 
 # --------------------------- Args ---------------------------
 parser = argparse.ArgumentParser(description='SWA-ASWA training (+ function-side ensembles)')
@@ -31,6 +32,7 @@ parser.add_argument('--wd', type=float, default=1e-4)
 
 parser.add_argument('--swa', action='store_true', help='enable SWA averaging')
 parser.add_argument('--aswa', action='store_true', help='enable ASWA tri-state update (uses val)')
+parser.add_argument('--no_aswa', action='store_true', help='when --swa is on, disable ASWA (default: off)')
 
 parser.add_argument('--swa_start', type=int, default=161, help='epoch to start SWA averaging (1-based)')
 parser.add_argument('--swa_lr', type=float, default=0.05, help='constant LR during SWA stage')
@@ -48,6 +50,13 @@ parser.add_argument('--func_weights', type=str, default=None,
                     help='optional path to weights (json/npy) of length K; default=uniform')
 
 args = parser.parse_args()
+
+# --- 自动行为：开了 SWA 就默认同时跑 ASWA（除非 --no_aswa） ---
+if args.swa and not args.no_aswa:
+    args.aswa = True
+# （可选）若只写了 --aswa，也自动打开 --swa，避免误用
+if args.aswa:
+    args.swa = True
 
 # --------------------------- Setup ---------------------------
 print('Preparing directory %s' % args.dir)
@@ -122,7 +131,7 @@ swa_n = 0
 
 aswa_model = build_model()
 aswa_model.load_state_dict(swa_model.state_dict())
-aswa_ensemble_weights = [1.0]  # 初始包含“起始 aswa_model”的权重（与当前实现一致）
+aswa_ensemble_weights = [1.0]  # 初始包含“起始 aswa_model”的权重
 
 model.to(device)
 swa_model.to(device)
@@ -131,7 +140,7 @@ aswa_model.to(device)
 # 用于函数侧集成：只使用“按 SWA 频率收集”的快照
 swa_snapshots = []  # list of CPU state_dict (each is a full model snapshot)
 
-# --------------------------- LR schedule ---------------------------
+# --------------------------- Helpers ---------------------------
 def schedule(epoch):
     # epoch 从 0 开始
     t = (epoch) / (args.swa_start if args.swa else args.epochs)
@@ -144,6 +153,35 @@ def schedule(epoch):
         factor = lr_ratio
     return args.lr_init * factor
 
+@torch.no_grad()
+def eval_nll_ece(model_, loader, device_):
+    """返回 {'acc':float, 'nll':float, 'ece':float}，和结构无关（VGG/ResNet/WRN通用）"""
+    model_.eval()
+    probs_all, labels_all = [], []
+    for x, y in loader:
+        x = x.to(device_, non_blocking=True)
+        logits = model_(x)
+        probs = F.softmax(logits, dim=1).float().detach().cpu().numpy()
+        probs_all.append(probs)
+        labels_all.append(y.numpy())
+    probs = np.concatenate(probs_all, axis=0)
+    labels = np.concatenate(labels_all, axis=0)
+    acc = float((probs.argmax(1) == labels).mean())
+    nll = float(-np.log(np.clip(probs[np.arange(labels.size), labels], 1e-12, 1.0)).mean())
+    # ECE（15 bins）
+    bins = np.linspace(0, 1, 16)
+    conf = probs.max(1)
+    preds = probs.argmax(1)
+    correct = (preds == labels).astype(np.float32)
+    ece = 0.0
+    for i in range(15):
+        lo, hi = bins[i], bins[i+1]
+        m = (conf > lo) & (conf <= hi) if i > 0 else (conf >= lo) & (conf <= hi)
+        if m.any():
+            ece += m.mean() * abs(correct[m].mean() - conf[m].mean())
+    return {'acc': acc, 'nll': nll, 'ece': ece}
+
+# --------------------------- Optim ---------------------------
 criterion = F.cross_entropy
 if args.optim == "SGD":
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr_init,
@@ -197,7 +235,6 @@ for epoch in range(start_epoch, args.epochs):
         # (1.1) 收集快照（只使用 SWA 的采样节奏；按 stride 下采样）
         idx_since_start = (epoch + 1 - args.swa_start)
         if (idx_since_start % max(1, args.snapshot_stride)) == 0:
-            # 只存 CPU 版，避免显存增长
             swa_snapshots.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
 
         # -------------- ASWA tri-state --------------
@@ -210,10 +247,9 @@ for epoch in range(start_epoch, args.epochs):
             current_aswa_state_dict = copy.deepcopy(aswa_model.state_dict())
             aswa_state_dict = copy.deepcopy(aswa_model.state_dict())
 
-            # (2.3) 试图把“当前 model”并入 ASWA（软/硬这里按你现有权重逻辑：等权新增）
+            # (2.3) 试图把“当前 model”并入 ASWA（等权新增）
             total_w = sum(aswa_ensemble_weights)
             for k, params in model.state_dict().items():
-                # new = (total_w * old + 1 * params) / (total_w + 1)
                 aswa_state_dict[k] = (aswa_state_dict[k] * total_w + params) / (total_w + 1.0)
 
             # (2.4) 验证“临时并入后的”表现
@@ -304,15 +340,19 @@ print("Running model Test: ", utils.eval(loaders['test'],  model, criterion, dev
 
 if args.swa:
     utils.bn_update(loaders['train'], swa_model)
+    swa_test_full = eval_nll_ece(swa_model, loaders['test'], device)
     print("SWA Train: ", utils.eval(loaders['train'], swa_model, criterion, device))
     print("SWA Val:   ", utils.eval(loaders['val'],   swa_model, criterion, device))
     print("SWA Test:  ", utils.eval(loaders['test'],  swa_model, criterion, device))
+    print(f"SWA Test (Acc/NLL/ECE): Acc={swa_test_full['acc']:.4f} | NLL={swa_test_full['nll']:.4f} | ECE={swa_test_full['ece']:.4f}")
 
 if args.aswa:
     utils.bn_update(loaders['train'], aswa_model)
+    aswa_test_full = eval_nll_ece(aswa_model, loaders['test'], device)
     print("ASWA Train: ", utils.eval(loaders['train'], aswa_model, criterion, device))
     print("ASWA Val:   ", utils.eval(loaders['val'],   aswa_model, criterion, device))
     print("ASWA Test:  ", utils.eval(loaders['test'],  aswa_model, criterion, device))
+    print(f"ASWA Test (Acc/NLL/ECE): Acc={aswa_test_full['acc']:.4f} | NLL={aswa_test_full['nll']:.4f} | ECE={aswa_test_full['ece']:.4f}")
 
 # --------------------------- Function-side ensembles (from SWA snapshots) ---------------------------
 if args.do_func_ens and len(swa_snapshots) > 0:
@@ -320,7 +360,6 @@ if args.do_func_ens and len(swa_snapshots) > 0:
     w = None
     if args.func_weights is not None and os.path.isfile(args.func_weights):
         if args.func_weights.endswith('.npy'):
-            import numpy as np
             w = np.load(args.func_weights)
         elif args.func_weights.endswith('.json'):
             with open(args.func_weights, 'r') as f:
