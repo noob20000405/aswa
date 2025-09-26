@@ -134,53 +134,103 @@ def bn_update(loader, model):
 
     model.apply(lambda module: _set_momenta(module, momenta))
 
-import numpy as np, torch, torch.nn.functional as F
+import numpy as np
+import torch
+import torch.nn.functional as F
 
 @torch.no_grad()
 def _eval_probs_metrics(probs_list, labels_list):
     probs = np.concatenate(probs_list, axis=0)
     labels = np.concatenate(labels_list, axis=0)
-    acc = float((probs.argmax(1)==labels).mean())
-    nll = float(-np.log(np.clip(probs[np.arange(labels.size), labels], 1e-12, 1.)).mean())
+    acc = float((probs.argmax(1) == labels).mean())
+    nll = float(-np.log(np.clip(probs[np.arange(labels.size), labels], 1e-12, 1.0)).mean())
     # ECE（15 bins）
-    conf = probs.max(1); preds = probs.argmax(1); correct = (preds==labels).astype(np.float32)
-    bins = np.linspace(0,1,16); ece=0.0
+    bins = np.linspace(0, 1, 16)
+    conf = probs.max(1)
+    preds = probs.argmax(1)
+    correct = (preds == labels).astype(np.float32)
+    ece = 0.0
     for i in range(15):
-        lo,hi=bins[i],bins[i+1]
-        m=(conf>lo)&(conf<=hi) if i>0 else (conf>=lo)&(conf<=hi)
-        if m.any(): ece += m.mean()*abs(correct[m].mean()-conf[m].mean())
-    return {'acc':acc, 'nll':nll, 'ece':ece}
+        lo, hi = bins[i], bins[i+1]
+        m = (conf > lo) & (conf <= hi) if i > 0 else (conf >= lo) & (conf <= hi)
+        if m.any():
+            ece += m.mean() * abs(correct[m].mean() - conf[m].mean())
+    return {'acc': acc, 'nll': nll, 'ece': ece}
 
 @torch.no_grad()
 def evaluate_function_ensemble_linear(snapshots, loader, device, build_model_fn, weights=None):
-    K=len(snapshots)
-    w=np.ones(K)/K if weights is None else np.asarray(weights, dtype=np.float64)
-    models=[build_model_fn() for _ in range(K)]
-    for m,sd in zip(models, snapshots): m.load_state_dict(sd, strict=True); m.to(device).eval()
-    probs_all=[]; labels_all=[]
-    for x,y in loader:
-        x=x.to(device); B=x.size(0)
-        mix=torch.zeros(B, models[0].fc.out_features, dtype=torch.float32, device=device)
-        for j,m in enumerate(models):
-            p=F.softmax(m(x), dim=1)
-            mix += p * float(w[j])
-        probs_all.append(mix.detach().cpu().numpy()); labels_all.append(y.numpy())
+    """
+    线性池化:  p_mix = sum_j alpha_j * softmax(f_j(x))
+    与模型结构无关（VGG/ResNet/WRN均可），不依赖 .fc 属性。
+    """
+    K = len(snapshots)
+    if K == 0:
+        return {'acc': 0.0, 'nll': 0.0, 'ece': 0.0}
+    # 权重
+    if weights is None:
+        w = np.ones(K, dtype=np.float64) / float(K)
+    else:
+        w = np.asarray(weights, dtype=np.float64).reshape(-1)
+        assert w.size == K, f"weights length {w.size} != #snapshots {K}"
+        s = w.sum()
+        w = np.ones(K)/K if (not np.isfinite(s) or s <= 0) else (w / s)
+
+    # 构建模型列表
+    models = [build_model_fn() for _ in range(K)]
+    for m, sd in zip(models, snapshots):
+        m.load_state_dict(sd, strict=True)
+        m.to(device).eval()
+
+    probs_all, labels_all = [], []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        mix = None  # 见第一轮
+        for j, m in enumerate(models):
+            p = F.softmax(m(x), dim=1)  # [B, C]
+            if mix is None:
+                mix = torch.zeros_like(p)  # [B, C]
+            mix.add_(p, alpha=float(w[j]))
+        probs_all.append(mix.detach().cpu().numpy())
+        labels_all.append(y.numpy())
+
     return _eval_probs_metrics(probs_all, labels_all)
 
 @torch.no_grad()
 def evaluate_function_ensemble_logpool(snapshots, loader, device, build_model_fn, weights=None):
-    K=len(snapshots)
-    w=np.ones(K)/K if weights is None else np.asarray(weights, dtype=np.float64)
-    models=[build_model_fn() for _ in range(K)]
-    for m,sd in zip(models, snapshots): m.load_state_dict(sd, strict=True); m.to(device).eval()
-    probs_all=[]; labels_all=[]
-    for x,y in loader:
-        x=x.to(device); B=x.size(0)
-        log_mix=torch.zeros(B, models[0].fc.out_features, dtype=torch.float64, device=device)
-        for j,m in enumerate(models):
-            logp=F.log_softmax(m(x), dim=1).double()
-            log_mix += float(w[j]) * logp
-        probs=torch.softmax(log_mix, dim=1).float()
-        probs_all.append(probs.detach().cpu().numpy()); labels_all.append(y.numpy())
+    """
+    对数池化（几何平均）:  p_mix ∝ exp( sum_j alpha_j * log_softmax(f_j(x)) )
+    同样与模型结构无关。
+    """
+    K = len(snapshots)
+    if K == 0:
+        return {'acc': 0.0, 'nll': 0.0, 'ece': 0.0}
+    # 权重
+    if weights is None:
+        w = np.ones(K, dtype=np.float64) / float(K)
+    else:
+        w = np.asarray(weights, dtype=np.float64).reshape(-1)
+        assert w.size == K, f"weights length {w.size} != #snapshots {K}"
+        s = w.sum()
+        w = np.ones(K)/K if (not np.isfinite(s) or s <= 0) else (w / s)
+
+    models = [build_model_fn() for _ in range(K)]
+    for m, sd in zip(models, snapshots):
+        m.load_state_dict(sd, strict=True)
+        m.to(device).eval()
+
+    probs_all, labels_all = [], []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        log_mix = None
+        for j, m in enumerate(models):
+            logp = F.log_softmax(m(x), dim=1).double()  # [B, C]
+            if log_mix is None:
+                log_mix = torch.zeros_like(logp)         # [B, C]
+            log_mix.add_(logp, alpha=float(w[j]))
+        probs = torch.softmax(log_mix, dim=1).float()
+        probs_all.append(probs.detach().cpu().numpy())
+        labels_all.append(y.numpy())
+
     return _eval_probs_metrics(probs_all, labels_all)
+
 
