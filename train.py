@@ -33,7 +33,8 @@ parser.add_argument('--wd', type=float, default=1e-4, help='weight decay (defaul
 parser.add_argument('--swa', action='store_true', help='swa usage flag (default: off)')
 parser.add_argument('--aswa', action='store_true', help='aswa usage flag (default: off)')
 
-parser.add_argument('--swa_start', type=float, default=1, metavar='N', help='SWA start epoch number (default: 161)')
+parser.add_argument('--swa_start', type=int, default=161, metavar='N',
+                    help='SWA start epoch number (default: 161)')
 parser.add_argument('--swa_lr', type=float, default=0.05, metavar='LR', help='SWA LR (default: 0.05)')
 parser.add_argument('--swa_c_epochs', type=int, default=1, metavar='N',
                     help='SWA model collection frequency/cycle length in epochs (default: 1)')
