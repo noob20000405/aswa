@@ -128,6 +128,16 @@ val_noaug_loader = torch.utils.data.DataLoader(
     pin_memory=True
 )
 
+# 在构建 val_noaug_loader 之后，紧跟着加：
+train_noaug_loader = torch.utils.data.DataLoader(
+    full_train_noaug,
+    batch_size=args.batch_size,
+    shuffle=False,
+    num_workers=args.num_workers,
+    pin_memory=True
+)
+
+
 
 # Loaders
 print(f"|Train|:{len(train_set)} |Val|:{len(val_set)} |Test|:{len(test_set)}")
@@ -353,7 +363,8 @@ print(f"Running (Acc/NLL/ECE) Val  : {run_val}")
 print(f"Running (Acc/NLL/ECE) Test : {run_test}")
 
 if args.swa:
-    utils.bn_update(loaders['train'], swa_model)
+    # utils.bn_update(loaders['train'], swa_model)
+    utils.bn_update(train_noaug_loader, swa_model)
     print("SWA Train: ", utils.eval(loaders['train'], swa_model, criterion, device))
     print("SWA Val:", utils.eval(loaders['val'], swa_model, criterion, device))
     print("SWA Test:", utils.eval(loaders['test'], swa_model, criterion, device))
@@ -365,7 +376,8 @@ if args.swa:
     print(f"SWA (Acc/NLL/ECE) Test : {swa_test}")
 
 if args.aswa:
-    utils.bn_update(loaders['train'], aswa_model)
+    # utils.bn_update(loaders['train'], aswa_model)
+    utils.bn_update(train_noaug_loader, aswa_model)
     print("ASWA Train: ", utils.eval(loaders['train'], aswa_model, criterion, device))
     print("ASWA Val:", utils.eval(loaders['val'], aswa_model, criterion, device))
     print("ASWA Test:", utils.eval(loaders['test'], aswa_model, criterion, device))
@@ -379,7 +391,10 @@ if args.aswa:
 # ---------------- Function-side ensembles (optional; 默认关闭，不影响原行为) ----------------
 def _build_crit_subset_indices(ref_model, val_loader, frac):
     """基于 ref_model 的验证集 margin 选底部 frac 样本；frac∈(0,1]；返回索引或 None"""
-    utils.bn_update(loaders['train'], ref_model)
+    # utils.bn_update(loaders['train'], ref_model)
+    utils.bn_update(train_noaug_loader, ref_model)  # 用 no-aug 训练集
+
+  
     # 计算 margin
     ref_model.eval()
     logits_all, labels_all = [], []
@@ -405,9 +420,15 @@ def _cache_val_probs_or_logprobs(snapshots, loader, build_model_fn, want_log=Fal
     """按快照顺序逐个推理，返回 list[K]，每个 [N,C] 的 float32 numpy 数组。"""
     outs = []
     for sd in snapshots:
+        # m = build_model_fn()
+        # m.load_state_dict(sd, strict=True)
+        # m.to(device).eval()
         m = build_model_fn()
         m.load_state_dict(sd, strict=True)
-        m.to(device).eval()
+        m.to(device)
+        utils.bn_update(train_noaug_loader, m)  # ★ 每个快照单独 BN 重估（no-aug）
+        m.eval()
+      
         chunks = []
         for x, _ in loader:
             x = x.to(device, non_blocking=True)
@@ -657,9 +678,16 @@ def _eval_function_ensemble(snapshots, weights, loader, build_model_fn, mode='li
     # 逐快照推理并累计
     mix_probs = None
     for j in range(K):
+        # m = build_model_fn()
+        # m.load_state_dict(snapshots[j], strict=True)
+        # m.to(device).eval()
         m = build_model_fn()
         m.load_state_dict(snapshots[j], strict=True)
-        m.to(device).eval()
+        m.to(device)
+        utils.bn_update(train_noaug_loader, m)  # ★
+        m.eval()
+
+      
         chunk_probs = []
         for x, _ in loader:
             x = x.to(device, non_blocking=True)
