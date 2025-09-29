@@ -65,6 +65,9 @@ parser.add_argument('--func_w_l2', type=float, default=0.0,
 parser.add_argument('--func_w_eta', type=float, default=0.0,
                     help='Correlation (quadratic) coeff η for α-learning. Default 0 keeps old behavior.')
 
+# ★ 新增：是否使用“类条件”权重（K×C）；默认 False，不影响原路径
+parser.add_argument('--func_class_cond', action='store_true',
+                    help='if set, learn/use class-conditional weights A[K,C] instead of a single alpha vector [K]')
 
 args = parser.parse_args()
 
@@ -105,11 +108,9 @@ num_classes = max(train_set.targets) + 1
 train_set, val_set = random_split(train_set, [train_size, val_size], generator=torch.Generator().manual_seed(args.seed))
 
 # ---- Build a no-augmentation view of *the same* val split ----
-# 取出 random_split 产生的 val 下标
 assert hasattr(val_set, 'indices'), "val_set must be a torch.utils.data.Subset"
 val_indices = val_set.indices
 
-# 用 eval transform 构建一个“无增强的完整训练集”视图，再用相同 indices 做子集
 if args.dataset == "CIFAR10":
     full_train_noaug = torchvision.datasets.CIFAR10(
         root='./data', train=True, download=False, transform=model_cfg.transform_test
@@ -127,17 +128,6 @@ val_noaug_loader = torch.utils.data.DataLoader(
     num_workers=args.num_workers,
     pin_memory=True
 )
-
-# 在构建 val_noaug_loader 之后，紧跟着加：
-# train_noaug_loader = torch.utils.data.DataLoader(
-#     full_train_noaug,
-#     batch_size=args.batch_size,
-#     shuffle=False,
-#     num_workers=args.num_workers,
-#     pin_memory=True
-# )
-
-
 
 # Loaders
 print(f"|Train|:{len(train_set)} |Val|:{len(val_set)} |Test|:{len(test_set)}")
@@ -364,7 +354,6 @@ print(f"Running (Acc/NLL/ECE) Test : {run_test}")
 
 if args.swa:
     utils.bn_update(loaders['train'], swa_model)
-    # utils.bn_update(train_noaug_loader, swa_model)
     print("SWA Train: ", utils.eval(loaders['train'], swa_model, criterion, device))
     print("SWA Val:", utils.eval(loaders['val'], swa_model, criterion, device))
     print("SWA Test:", utils.eval(loaders['test'], swa_model, criterion, device))
@@ -377,7 +366,6 @@ if args.swa:
 
 if args.aswa:
     utils.bn_update(loaders['train'], aswa_model)
-    # utils.bn_update(train_noaug_loader, aswa_model)
     print("ASWA Train: ", utils.eval(loaders['train'], aswa_model, criterion, device))
     print("ASWA Val:", utils.eval(loaders['val'], aswa_model, criterion, device))
     print("ASWA Test:", utils.eval(loaders['test'], aswa_model, criterion, device))
@@ -392,10 +380,6 @@ if args.aswa:
 def _build_crit_subset_indices(ref_model, val_loader, frac):
     """基于 ref_model 的验证集 margin 选底部 frac 样本；frac∈(0,1]；返回索引或 None"""
     utils.bn_update(loaders['train'], ref_model)
-    # utils.bn_update(train_noaug_loader, ref_model)  # 用 no-aug 训练集
-
-  
-    # 计算 margin
     ref_model.eval()
     logits_all, labels_all = [], []
     with torch.no_grad():
@@ -420,16 +404,11 @@ def _cache_val_probs_or_logprobs(snapshots, loader, build_model_fn, want_log=Fal
     """按快照顺序逐个推理，返回 list[K]，每个 [N,C] 的 float32 numpy 数组。"""
     outs = []
     for sd in snapshots:
-        # m = build_model_fn()
-        # m.load_state_dict(sd, strict=True)
-        # m.to(device).eval()
         m = build_model_fn()
         m.load_state_dict(sd, strict=True)
         m.to(device)
-        # utils.bn_update(train_noaug_loader, m)  # ★ 每个快照单独 BN 重估（no-aug）
-        utils.bn_update(loaders['train'], m)
+        utils.bn_update(loaders['train'], m)  # 与主线一致：在训练分布上更新 BN
         m.eval()
-      
         chunks = []
         for x, _ in loader:
             x = x.to(device, non_blocking=True)
@@ -448,27 +427,18 @@ def _build_M_from_true_probs(P_list, y):
     Return: M [K,K] (float64, PSD) built from centered true-class prob matrix F (K×N)
     """
     K = len(P_list)
-    # F[k, n] = P_k(n, y_n)
     F = np.stack([Pi[np.arange(y.size), y] for Pi in P_list], axis=0).astype(np.float64)  # [K,N]
-    F = F - F.mean(axis=1, keepdims=True)  # center each row
+    F = F - F.mean(axis=1, keepdims=True)
     N = max(1, F.shape[1])
-    M = (F @ F.T) / float(N)               # covariance-like, PSD
-    # 数值稳健：trace 归一到 K（可不做；保持量级稳定）
+    M = (F @ F.T) / float(N)
     tr = np.trace(M)
     if np.isfinite(tr) and tr > 1e-12:
         M = M * (K / tr)
     return M
 
-
-def _learn_alpha_on_val_linear(snapshots, loader_val, build_model_fn, steps=150, lr=0.3, S_idx=None):
-    """
-    在 val(noaug) 上学习 α（线性概率混合目标）。
-    - 不依赖外部缓存助手，逐快照评估，显存友好。
-    - 全程 float64，避免 dtype 冲突。
-    """
+# ---- α 学习（支持向量α[K]与类条件A[K,C]）----
+def _learn_alpha_on_val_linear(snapshots, loader_val, build_model_fn, steps=150, lr=0.3, S_idx=None, class_cond=False):
     device_ = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-    # 收集标签（与 loader_val 顺序严格对齐）
     labels = []
     for _, y in loader_val:
         labels.append(y.numpy())
@@ -478,45 +448,37 @@ def _learn_alpha_on_val_linear(snapshots, loader_val, build_model_fn, steps=150,
     K = len(snapshots)
     assert K > 0, "No SWA snapshots to learn α from."
 
-    # 逐快照缓存: P_list[k] 是 [N,C] 的概率矩阵（float64）
+    # 缓存概率
     P_list = []
-    for k, sd in enumerate(snapshots):
+    for sd in snapshots:
         m = build_model_fn()
         m.load_state_dict(sd, strict=True)
-        m.to(device_).eval()
-
+        m.to(device_)
+        utils.bn_update(loaders['train'], m)
+        m.eval()
         probs_chunks = []
         with torch.no_grad():
             for x, _ in loader_val:
                 x = x.to(device_, non_blocking=True)
-                p = torch.softmax(m(x), dim=1).double().cpu().numpy()  # -> float64
+                p = torch.softmax(m(x), dim=1).double().cpu().numpy()
                 probs_chunks.append(p)
         P_k = np.concatenate(probs_chunks, axis=0).astype(np.float64)
         assert P_k.shape[0] == N, "Val length mismatch while caching probs."
         P_list.append(P_k)
-
-        # 及时释放
         del m
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # 组装为 [K,N,C]
     C = P_list[0].shape[1]
     P = np.stack(P_list, axis=0).astype(np.float64)  # [K,N,C]
+    M_np = _build_M_from_true_probs(P_list, y)       # [K,K]
+    u_vec = np.ones(K, dtype=np.float64) / float(K)
 
-    # 相关性矩阵 M（K×K）与均匀向量 u（与 WRN 版一致）
-    # 假定你已实现 _build_M_from_true_probs(P_list, y) -> [K,K]
-    M_np = _build_M_from_true_probs(P_list, y)             # [K,K], float64
-    u_np = np.ones(K, dtype=np.float64) / float(max(1, K))
-
-    # 转 torch（float64, CPU）
-    phi = torch.zeros(K, dtype=torch.float64, requires_grad=True)
-    opt = torch.optim.Adam([phi], lr=lr)
-
+    # torch tensors（float64）
     y_t  = torch.from_numpy(y).long()
-    P_t  = torch.from_numpy(P).to(torch.float64)           # [K,N,C]
-    M_t  = torch.from_numpy(M_np).to(torch.float64)        # [K,K]
-    u_t  = torch.from_numpy(u_np).to(torch.float64)        # [K]
+    P_t  = torch.from_numpy(P).to(torch.float64)
+    M_t  = torch.from_numpy(M_np).to(torch.float64)
+    u_t  = torch.from_numpy(u_vec).to(torch.float64)
 
     if S_idx is not None:
         if isinstance(S_idx, np.ndarray):
@@ -528,41 +490,58 @@ def _learn_alpha_on_val_linear(snapshots, loader_val, build_model_fn, steps=150,
     else:
         idx_t = None
 
-    lam = float(getattr(args, 'func_w_l2', 1e-3))
-    eta = float(getattr(args, 'func_w_eta', 1e-2))
+    lam = float(getattr(args, 'func_w_l2', 0.0))
+    eta = float(getattr(args, 'func_w_eta', 0.0))
 
-    for _ in range(1, steps + 1):
-        opt.zero_grad()
-        w = torch.softmax(phi, dim=0)                          # [K], float64
-        mix = torch.einsum('k,knc->nc', w, P_t)                # [N,C], float64
+    if not class_cond:
+        # α[K]
+        phi = torch.zeros(K, dtype=torch.float64, requires_grad=True)
+        opt = torch.optim.Adam([phi], lr=lr)
+        for _ in range(1, steps + 1):
+            opt.zero_grad()
+            w = torch.softmax(phi, dim=0)                    # [K]
+            mix = torch.einsum('k,knc->nc', w, P_t)          # [N,C]
+            if idx_t is not None:
+                mix_sel = mix.index_select(0, idx_t)
+                y_sel   = y_t.index_select(0, idx_t)
+                ce = F.nll_loss(torch.log(mix_sel.clamp_min(1e-12)), y_sel)
+            else:
+                ce = F.nll_loss(torch.log(mix.clamp_min(1e-12)), y_t)
+            reg_l2 = lam * torch.sum((w - u_t) * (w - u_t))
+            quad   = eta * torch.sum(w * (M_t @ w))
+            (ce + reg_l2 + quad).backward()
+            opt.step()
+        with torch.no_grad():
+            w = torch.softmax(phi, dim=0).cpu().numpy().astype(np.float64)
+        return w
+    else:
+        # A[K,C]：每个类一列 softmax
+        phi = torch.zeros(K, C, dtype=torch.float64, requires_grad=True)
+        opt = torch.optim.Adam([phi], lr=lr)
+        U = torch.full((K, C), 1.0/float(K), dtype=torch.float64)
 
-        if idx_t is not None:
-            mix_sel = mix.index_select(0, idx_t)
-            y_sel   = y_t.index_select(0, idx_t)
-            ce = F.nll_loss(torch.log(mix_sel.clamp_min(1e-12)).to(torch.float64), y_sel)
-        else:
-            ce = F.nll_loss(torch.log(mix.clamp_min(1e-12)).to(torch.float64), y_t)
+        for _ in range(1, steps + 1):
+            opt.zero_grad()
+            A = torch.softmax(phi, dim=0)                    # [K,C]，按 K 归一
+            # 线性按类加权：mix[n,c] = sum_k A[k,c]*P[k,n,c]
+            mix = torch.einsum('kc,knc->nc', A, P_t)         # [N,C]
+            if idx_t is not None:
+                mix_sel = mix.index_select(0, idx_t)
+                y_sel   = y_t.index_select(0, idx_t)
+                ce = F.nll_loss(torch.log(mix_sel.clamp_min(1e-12)), y_sel)
+            else:
+                ce = F.nll_loss(torch.log(mix.clamp_min(1e-12)), y_t)
+            reg_l2 = lam * torch.sum((A - U) * (A - U))      # Frobenius
+            quad   = eta * torch.sum(A * (M_t @ A))          # trace(A^T M A)
+            (ce + reg_l2 + quad).backward()
+            opt.step()
 
-        reg_l2 = lam * torch.sum((w - u_t) * (w - u_t))
-        quad   = eta * torch.sum(w * (M_t @ w))
-        loss = ce + reg_l2 + quad
-        loss.backward()
-        opt.step()
+        with torch.no_grad():
+            A = torch.softmax(phi, dim=0).cpu().numpy().astype(np.float64)
+        return A  # [K,C]
 
-    with torch.no_grad():
-        w = torch.softmax(phi, dim=0).cpu().numpy().astype(np.float64)
-    return w
-
-
-def _learn_alpha_on_val_logpool(snapshots, loader_val, build_model_fn, steps=150, lr=0.3, S_idx=None):
-    """
-    在 val(noaug) 上学习 α（LogPool 目标：对数概率的加权和后再 softmax）。
-    - 同样逐快照缓存，显存友好。
-    - 全程 float64。
-    """
+def _learn_alpha_on_val_logpool(snapshots, loader_val, build_model_fn, steps=150, lr=0.3, S_idx=None, class_cond=False):
     device_ = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-    # 收集标签
     labels = []
     for _, y in loader_val:
         labels.append(y.numpy())
@@ -572,13 +551,13 @@ def _learn_alpha_on_val_logpool(snapshots, loader_val, build_model_fn, steps=150
     K = len(snapshots)
     assert K > 0, "No SWA snapshots to learn α from."
 
-    # 逐快照缓存：log-probs 与 probs（logpool 用 logp，相关性矩阵更稳用概率）
     L_list, P_list = [], []
-    for k, sd in enumerate(snapshots):
+    for sd in snapshots:
         m = build_model_fn()
         m.load_state_dict(sd, strict=True)
-        m.to(device_).eval()
-
+        m.to(device_)
+        utils.bn_update(loaders['train'], m)
+        m.eval()
         logp_chunks, probs_chunks = [], []
         with torch.no_grad():
             for x, _ in loader_val:
@@ -586,33 +565,25 @@ def _learn_alpha_on_val_logpool(snapshots, loader_val, build_model_fn, steps=150
                 out = m(x)
                 logp = torch.log_softmax(out, dim=1).double().cpu().numpy()
                 p    = torch.softmax(out, dim=1).double().cpu().numpy()
-                logp_chunks.append(logp)
-                probs_chunks.append(p)
-        L_k = np.concatenate(logp_chunks, axis=0).astype(np.float64)  # [N,C]
-        P_k = np.concatenate(probs_chunks, axis=0).astype(np.float64)  # [N,C]
+                logp_chunks.append(logp); probs_chunks.append(p)
+        L_k = np.concatenate(logp_chunks, axis=0).astype(np.float64)
+        P_k = np.concatenate(probs_chunks, axis=0).astype(np.float64)
         assert L_k.shape[0] == N and P_k.shape[0] == N
-        L_list.append(L_k)
-        P_list.append(P_k)
-
+        L_list.append(L_k); P_list.append(P_k)
         del m
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # 组装为 [K,N,C]
     C = L_list[0].shape[1]
     L = np.stack(L_list, axis=0).astype(np.float64)  # [K,N,C]
-    # 相关性矩阵（基于概率）
+    P = np.stack(P_list, axis=0).astype(np.float64)  # for M
     M_np = _build_M_from_true_probs(P_list, y)       # [K,K]
-    u_np = np.ones(K, dtype=np.float64) / float(max(1, K))
-
-    # 转 torch（float64, CPU）
-    phi = torch.zeros(K, dtype=torch.float64, requires_grad=True)
-    opt = torch.optim.Adam([phi], lr=lr)
+    u_vec = np.ones(K, dtype=np.float64) / float(K)
 
     y_t  = torch.from_numpy(y).long()
-    L_t  = torch.from_numpy(L).to(torch.float64)     # [K,N,C]
+    L_t  = torch.from_numpy(L).to(torch.float64)
     M_t  = torch.from_numpy(M_np).to(torch.float64)
-    u_t  = torch.from_numpy(u_np).to(torch.float64)
+    u_t  = torch.from_numpy(u_vec).to(torch.float64)
 
     if S_idx is not None:
         if isinstance(S_idx, np.ndarray):
@@ -624,32 +595,53 @@ def _learn_alpha_on_val_logpool(snapshots, loader_val, build_model_fn, steps=150
     else:
         idx_t = None
 
-    lam = float(getattr(args, 'func_w_l2', 1e-3))
-    eta = float(getattr(args, 'func_w_eta', 1e-2))
+    lam = float(getattr(args, 'func_w_l2', 0.0))
+    eta = float(getattr(args, 'func_w_eta', 0.0))
 
-    for _ in range(1, steps + 1):
-        opt.zero_grad()
-        w = torch.softmax(phi, dim=0)                               # [K]
-        log_mix = torch.einsum('k,knc->nc', w, L_t)                 # [N,C]
+    if not class_cond:
+        phi = torch.zeros(K, dtype=torch.float64, requires_grad=True)
+        opt = torch.optim.Adam([phi], lr=lr)
+        for _ in range(1, steps + 1):
+            opt.zero_grad()
+            w = torch.softmax(phi, dim=0)                         # [K]
+            log_mix = torch.einsum('k,knc->nc', w, L_t)           # [N,C]
+            if idx_t is not None:
+                log_sel = log_mix.index_select(0, idx_t)
+                y_sel   = y_t.index_select(0, idx_t)
+                ce = F.nll_loss(F.log_softmax(log_sel, dim=1), y_sel)
+            else:
+                ce = F.nll_loss(F.log_softmax(log_mix, dim=1), y_t)
+            reg_l2 = lam * torch.sum((w - u_t) * (w - u_t))
+            quad   = eta * torch.sum(w * (M_t @ w))
+            (ce + reg_l2 + quad).backward()
+            opt.step()
+        with torch.no_grad():
+            w = torch.softmax(phi, dim=0).cpu().numpy().astype(np.float64)
+        return w
+    else:
+        phi = torch.zeros(K, C, dtype=torch.float64, requires_grad=True)
+        opt = torch.optim.Adam([phi], lr=lr)
+        U = torch.full((K, C), 1.0/float(K), dtype=torch.float64)
 
-        if idx_t is not None:
-            log_sel = log_mix.index_select(0, idx_t)
-            y_sel   = y_t.index_select(0, idx_t)
-            ce = F.nll_loss(torch.log_softmax(log_sel, dim=1).to(torch.float64), y_sel)
-        else:
-            ce = F.nll_loss(torch.log_softmax(log_mix, dim=1).to(torch.float64), y_t)
+        for _ in range(1, steps + 1):
+            opt.zero_grad()
+            A = torch.softmax(phi, dim=0)                          # [K,C]
+            # 按类对 log 概率加权：log_mix[n,c] = sum_k A[k,c]*logp_k(n,c)
+            log_mix = torch.einsum('kc,knc->nc', A, L_t)           # [N,C]
+            if idx_t is not None:
+                log_sel = log_mix.index_select(0, idx_t)
+                y_sel   = y_t.index_select(0, idx_t)
+                ce = F.nll_loss(F.log_softmax(log_sel, dim=1), y_sel)
+            else:
+                ce = F.nll_loss(F.log_softmax(log_mix, dim=1), y_t)
+            reg_l2 = lam * torch.sum((A - U) * (A - U))
+            quad   = eta * torch.sum(A * (M_t @ A))
+            (ce + reg_l2 + quad).backward()
+            opt.step()
 
-        reg_l2 = lam * torch.sum((w - u_t) * (w - u_t))
-        quad   = eta * torch.sum(w * (M_t @ w))
-        loss = ce + reg_l2 + quad
-        loss.backward()
-        opt.step()
-
-    with torch.no_grad():
-        w = torch.softmax(phi, dim=0).cpu().numpy().astype(np.float64)
-    return w
-
-
+        with torch.no_grad():
+            A = torch.softmax(phi, dim=0).cpu().numpy().astype(np.float64)
+        return A  # [K,C]
 
 def _load_or_uniform_weights(K):
     w = None
@@ -672,55 +664,63 @@ def _load_or_uniform_weights(K):
 
 @torch.no_grad()
 def _eval_function_ensemble(snapshots, weights, loader, build_model_fn, mode='linear'):
-    """在测试集上评估函数侧集成，返回 dict(acc,nll,ece)。"""
+    """在测试集上评估函数侧集成，返回 dict(acc,nll,ece)。
+       支持 weights 为 α[K] 或 A[K,C]。"""
     K = len(snapshots)
-    weights = np.asarray(weights, dtype=np.float32)
+    weights = np.asarray(weights)
+    class_cond = (weights.ndim == 2)  # A[K,C]?
     probs_all, labels_all = [], []
+    mix_accum = None  # 对 linear：累计概率；对 logpool：累计加权 log 概率
+
     # 逐快照推理并累计
-    mix_probs = None
     for j in range(K):
-        # m = build_model_fn()
-        # m.load_state_dict(snapshots[j], strict=True)
-        # m.to(device).eval()
         m = build_model_fn()
         m.load_state_dict(snapshots[j], strict=True)
         m.to(device)
-        # utils.bn_update(train_noaug_loader, m)  # ★
         utils.bn_update(loaders['train'], m)
         m.eval()
 
-      
-        chunk_probs = []
+        chunk_list = []
         for x, _ in loader:
             x = x.to(device, non_blocking=True)
             if mode == 'logpool':
-                logp = F.log_softmax(m(x), dim=1).float()
-                chunk_probs.append(logp.detach().cpu().numpy())
+                arr = F.log_softmax(m(x), dim=1).double().cpu().numpy()
             else:
-                p = F.softmax(m(x), dim=1).float()
-                chunk_probs.append(p.detach().cpu().numpy())
-        chunk = np.concatenate(chunk_probs, axis=0)  # [N,C]
-        if mode == 'logpool':
-            contrib = weights[j] * chunk  # log 概率的加权求和
-            mix_probs = contrib if mix_probs is None else (mix_probs + contrib)
+                arr = F.softmax(m(x), dim=1).double().cpu().numpy()
+            chunk_list.append(arr)
+        pred = np.concatenate(chunk_list, axis=0)  # [N,C] float64
+
+        if class_cond:
+            # 按类乘以 A[j,:]
+            wj = weights[j].reshape(1, -1)  # [1,C]
+            contrib = pred * wj             # [N,C]
         else:
-            contrib = weights[j] * chunk
-            mix_probs = contrib if mix_probs is None else (mix_probs + contrib)
+            # 标量权重
+            wj = float(weights[j])
+            contrib = pred * wj
+
+        if mix_accum is None:
+            mix_accum = contrib
+        else:
+            mix_accum = mix_accum + contrib
+
         del m
         torch.cuda.empty_cache()
-
-    if mode == 'logpool':
-        probs = torch.softmax(torch.from_numpy(mix_probs), dim=1).numpy().astype(np.float32)
-    else:
-        probs = mix_probs.astype(np.float32)
 
     # 收集标签一次即可
     for _, y in loader: labels_all.append(y.numpy())
     labels = np.concatenate(labels_all, axis=0)
 
-    acc = float((probs.argmax(1) == labels).mean())
-    nll = float(-np.log(np.clip(probs[np.arange(labels.size), labels], 1e-12, 1.0)).mean())
-    bins = np.linspace(0,1,16); conf = probs.max(1); correct = (probs.argmax(1)==labels).astype(np.float32)
+    if mode == 'logpool':
+        probs = torch.softmax(torch.from_numpy(mix_accum), dim=1).numpy().astype(np.float32)
+    else:
+        probs = mix_accum.astype(np.float32)
+
+    preds = probs.argmax(1)
+    acc = float((preds == labels).mean())
+    p_true = np.clip(probs[np.arange(labels.size), labels], 1e-12, 1.0)
+    nll = float(-np.log(p_true).mean())
+    bins = np.linspace(0,1,16); conf = probs.max(1); correct = (preds==labels).astype(np.float32)
     ece=0.0
     for i in range(15):
         lo,hi=bins[i],bins[i+1]
@@ -744,15 +744,27 @@ if args.do_func_ens and len(swa_snapshots) > 0:
 
     if args.learn_func_w:
         if args.func_w_type == 'linear':
-            alpha = _learn_alpha_on_val_linear(swa_snapshots, val_noaug_loader, _bm,
-                                               steps=args.func_w_steps, lr=args.func_w_lr, S_idx=S_idx)
+            alpha = _learn_alpha_on_val_linear(
+                swa_snapshots, val_noaug_loader, _bm,
+                steps=args.func_w_steps, lr=args.func_w_lr, S_idx=S_idx,
+                class_cond=args.func_class_cond
+            )
         else:
-            alpha = _learn_alpha_on_val_logpool(swa_snapshots, val_noaug_loader, _bm,
-                                                steps=args.func_w_steps, lr=args.func_w_lr, S_idx=S_idx)
-        print("[Func-Ensemble] learned α (sum=1):", np.round(alpha, 4).tolist())
+            alpha = _learn_alpha_on_val_logpool(
+                swa_snapshots, val_noaug_loader, _bm,
+                steps=args.func_w_steps, lr=args.func_w_lr, S_idx=S_idx,
+                class_cond=args.func_class_cond
+            )
+        shape_info = alpha.shape if isinstance(alpha, np.ndarray) else (len(alpha),)
+        print("[Func-Ensemble] learned α shape:", shape_info, "; preview:", np.round(np.asarray(alpha).ravel()[:min(10, np.asarray(alpha).size)], 4).tolist())
     else:
-        alpha = _load_or_uniform_weights(len(swa_snapshots))
-        print("[Func-Ensemble] use weights:", np.round(alpha, 4).tolist())
+        # 若不开学习：仍维持向量等权重；若用户要求 class_cond，则等权矩阵
+        if args.func_class_cond:
+            K = len(swa_snapshots)
+            alpha = np.full((K, num_classes), 1.0/float(K), dtype=np.float64)
+        else:
+            alpha = _load_or_uniform_weights(len(swa_snapshots))
+        print("[Func-Ensemble] use weights (uniform):", "matrix K×C" if args.func_class_cond else "vector K")
 
     # 测试集评测
     if args.func_type in ('linear','both'):
