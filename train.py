@@ -69,6 +69,10 @@ parser.add_argument('--func_w_eta', type=float, default=0.0,
 parser.add_argument('--func_class_cond', action='store_true',
                     help='if set, learn/use class-conditional weights A[K,C] instead of a single alpha vector [K]')
 
+parser.add_argument('--func_topk', type=int, default=0,
+    help='per-class top-k projection for class-conditional A[K,C]; 0 disables (default: 0)')
+
+
 args = parser.parse_args()
 
 print('Preparing directory %s' % args.dir)
@@ -436,6 +440,32 @@ def _build_M_from_true_probs(P_list, y):
         M = M * (K / tr)
     return M
 
+def _project_topk_per_class(A: np.ndarray, k_top: int) -> np.ndarray:
+    """
+    对类条件矩阵 A[K,C] 做 per-class top-k 投影：每列只保留最大的 k 个，其他置 0，并对该列重新归一化到 1。
+    k_top<=0 或 k_top>=K 时直接返回 A 本身（不改动）。
+    """
+    if not isinstance(A, np.ndarray):
+        A = np.asarray(A)
+    assert A.ndim == 2, "A must be KxC matrix for class-conditional weights."
+    K, C = A.shape
+    if k_top is None or k_top <= 0 or k_top >= K:
+        return A
+
+    out = np.zeros_like(A, dtype=np.float64)
+    for c in range(C):
+        col = A[:, c]
+        # 取该列 top-k 索引（降序）
+        keep = np.argsort(col)[::-1][:k_top]
+        s = float(col[keep].sum())
+        if not np.isfinite(s) or s <= 1e-12:
+            # 退化保护：该类全 0 时，回退为等权（不稀疏）
+            out[:, c] = 1.0 / K
+        else:
+            out[keep, c] = col[keep] / s
+    return out
+
+
 # ---- α 学习（支持向量α[K]与类条件A[K,C]）----
 def _learn_alpha_on_val_linear(snapshots, loader_val, build_model_fn, steps=150, lr=0.3, S_idx=None, class_cond=False):
     device_ = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -538,7 +568,11 @@ def _learn_alpha_on_val_linear(snapshots, loader_val, build_model_fn, steps=150,
 
         with torch.no_grad():
             A = torch.softmax(phi, dim=0).cpu().numpy().astype(np.float64)
+        # 仅当启用类条件且设置了 k_top>0 时做投影；否则保持原状
+        if class_cond and getattr(args, 'func_topk', 0) > 0:
+            A = _project_topk_per_class(A, int(args.func_topk))
         return A  # [K,C]
+
 
 def _learn_alpha_on_val_logpool(snapshots, loader_val, build_model_fn, steps=150, lr=0.3, S_idx=None, class_cond=False):
     device_ = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -641,7 +675,10 @@ def _learn_alpha_on_val_logpool(snapshots, loader_val, build_model_fn, steps=150
 
         with torch.no_grad():
             A = torch.softmax(phi, dim=0).cpu().numpy().astype(np.float64)
+        if class_cond and getattr(args, 'func_topk', 0) > 0:
+            A = _project_topk_per_class(A, int(args.func_topk))
         return A  # [K,C]
+
 
 def _load_or_uniform_weights(K):
     w = None
