@@ -402,39 +402,42 @@ def _cache_val_logits_no_bn(snapshots, loader, build_model_fn, device_):
             torch.cuda.empty_cache()
     return outs  # list of [N,C]
 
+@torch.no_grad()
 def _build_M_from_true_probs_no_bn(snapshots, loader_val, build_model_fn, device_, y_vec):
-    """用真类概率（不 BN 更新）构造 HAC 相关性矩阵 M[K,K]（PSD）。"""
+    """用真类概率（不做 BN 更新）构造 HAC 相关性矩阵 M[K,K]（PSD）。"""
     K = len(snapshots)
     N = y_vec.size
-    F = np.zeros((K, N), dtype=np.float64)  # [K,N]
-    with torch.no_grad():
-        for k, sd in enumerate(snapshots):
-            m = build_model_fn(); m.load_state_dict(sd, strict=True); m.to(device_).eval()
-            idx0 = 0
-            for x, y in loader_val:
-                x = x.to(device_, non_blocking=True)
-                p = F_softmax(m(x), dim=1) if False else None  # 占位，下一行直接算
-                logits = m(x)
-                probs = F.softmax(logits, dim=1).double().cpu().numpy()
-                y_np = y.numpy()
-                F[k, idx0:idx0+len(y_np)] = probs[np.arange(len(y_np)), y_np]
-                idx0 += len(y_np)
-            del m
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    P_true = np.zeros((K, N), dtype=np.float64)  # [K,N]
+
+    for k, sd in enumerate(snapshots):
+        m = build_model_fn()
+        m.load_state_dict(sd, strict=True)
+        m.to(device_).eval()
+        idx0 = 0
+        for x, y in loader_val:
+            x = x.to(device_, non_blocking=True)
+            logits = m(x)  # torch.Tensor
+            probs = torch.softmax(logits, dim=1).to(torch.float64).cpu().numpy()  # 软后再转 numpy
+            y_np = y.numpy()
+            P_true[k, idx0: idx0 + y_np.shape[0]] = probs[np.arange(y_np.shape[0]), y_np]
+            idx0 += y_np.shape[0]
+        del m
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     # 中心化并构建协方差型矩阵
-    Fc = F - F.mean(axis=1, keepdims=True)
-    M = (Fc @ Fc.T) / max(1, Fc.shape[1])
-    # 归一/PSD 投影（简单稳健版）
-    # PSD 投影
+    P_center = P_true - P_true.mean(axis=1, keepdims=True)
+    M = (P_center @ P_center.T) / max(1, P_center.shape[1])
+
+    # PSD 投影 + 迹归一
     w, V = np.linalg.eigh(M)
     w = np.maximum(w, 1e-9)
     M_psd = (V * w) @ V.T
-    # 迹归一（可选）
     tr = np.trace(M_psd)
     if np.isfinite(tr) and tr > 1e-12:
         M_psd = M_psd * (K / tr)
     return M_psd  # [K,K] float64
+
 
 def _project_topk_per_class(A: np.ndarray, k_top: int) -> np.ndarray:
     if not isinstance(A, np.ndarray):
