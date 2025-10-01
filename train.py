@@ -46,7 +46,9 @@ parser.add_argument('--val_ratio', type=float, default=0.1, help='validation rat
 # ---------- FS-Alpha：函数侧/权重学习 ----------
 parser.add_argument('--do_func_ens', action='store_true',
                     help='enable function-side ensemble evaluation on SWA snapshots')
-parser.add_argument('--func_type', type=str, default='both', choices=['linear', 'logpool', 'both'],
+# ✨ 最小扩展：加入 'logits' 选项；默认仍为 'both'，不影响现有脚本
+parser.add_argument('--func_type', type=str, default='both',
+                    choices=['linear', 'logpool', 'logits', 'both'],
                     help='function-side ensemble type')
 parser.add_argument('--func_weights', type=str, default=None,
                     help='optional path to weights (json/npy) for function ensemble; default uniform')
@@ -516,56 +518,77 @@ def _replace_last_linear(model, last_name, W_mix, b_mix):
     last.weight.copy_(torch.from_numpy(W_mix).to(last.weight.dtype).to(last.weight.device))
     last.bias.copy_(  torch.from_numpy(b_mix).to(last.bias.dtype).to(last.bias.device))
 
-# ====== 仅最小改动：为函数侧集成补齐“每快照 BN 重估”的可选开关 ======
+# ====== 函数侧集成：支持 BN 重估（与 HeadOnly 同口径），并新增 'logits' 模式 ======
 @torch.no_grad()
 def _eval_function_ensemble_from_alpha_bar(
     snapshots, alpha_bar, loader, build_model_fn, device, mode='linear',
-    bn_loader=None, bn_recal=False  # <-- 新增：可选 BN 重估
+    bn_loader=None, bn_recal=False
 ):
+    """
+    mode:
+      - 'linear'  : 概率算术平均
+      - 'logpool' : log 概率加权后再 softmax（几何平均）
+      - 'logits'  : logits 加权后再 softmax（与 HeadOnly 对偶）
+    """
     K = len(snapshots)
     alpha_bar = np.asarray(alpha_bar, dtype=np.float64)
-    mix_accum = None
-    labels_all = []
+
+    mix_store = None  # 'linear'：累加 prob；'logpool'：累加 logprob；'logits'：累加 logits
+
+    # 逐成员前向
     for j in range(K):
-        try: _fix_aug_rng()  # 验证集时固定增广；测试集通常无增广
+        try: _fix_aug_rng()
         except Exception: pass
         m = build_model_fn(); m.load_state_dict(snapshots[j], strict=True); m.to(device).eval()
 
-        # ✨ 可选：为每个快照重估 BN（与 HeadOnly 使用同一口径的 loader，例如 loaders['train']）
+        # 与 HeadOnly 同口径：按需在增广 train 上重估 BN；无 BN 则跳过
         if bn_recal and (bn_loader is not None):
-            utils.bn_update(bn_loader, m)
+            has_bn = any(isinstance(mm, nn.modules.batchnorm._BatchNorm) for mm in m.modules())
+            if has_bn:
+                utils.bn_update(bn_loader, m)
+            m.eval()  # 防止 bn_update 把模型留在 train()，避免 Dropout 干扰
 
-        chunk_list = []
+        chunks = []
         for x, _ in loader:
             x = x.to(device, non_blocking=True)
-            if mode == 'logpool':
-                arr = F.log_softmax(m(x), dim=1).double().cpu().numpy()
-            else:
-                arr = F.softmax(m(x), dim=1).double().cpu().numpy()
-            chunk_list.append(arr)
-        pred = np.concatenate(chunk_list, axis=0)  # [N,C]
-        mix_accum = pred * float(alpha_bar[j]) if mix_accum is None else (mix_accum + pred * float(alpha_bar[j]))
+            if mode == 'logits':
+                arr = m(x).double().cpu().numpy()                       # logits
+            elif mode == 'logpool':
+                arr = F.log_softmax(m(x), dim=1).double().cpu().numpy() # log-prob
+            else:  # 'linear'
+                arr = F.softmax(m(x), dim=1).double().cpu().numpy()     # prob
+            chunks.append(arr)
+
+        arr_full = np.concatenate(chunks, axis=0)  # [N,C]
+        w = float(alpha_bar[j])
+        mix_store = arr_full * w if mix_store is None else (mix_store + arr_full * w)
+
         del m
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
+    # 只遍历一次 loader 拿标签，避免重复
+    labels_all = []
     for _, y in loader:
         labels_all.append(y.numpy())
     labels = np.concatenate(labels_all, axis=0)
 
-    if mode == 'logpool':
-        probs = torch.softmax(torch.from_numpy(mix_accum), dim=1).numpy().astype(np.float32)
-    else:
-        probs = mix_accum.astype(np.float32)
+    # 统一得到概率
+    if mode in ('logpool', 'logits'):
+        probs = torch.softmax(torch.from_numpy(mix_store), dim=1).numpy().astype(np.float32)
+    else:  # 'linear'
+        probs = mix_store.astype(np.float32)
+
     preds = probs.argmax(1)
     acc = float((preds == labels).mean())
     p_true = np.clip(probs[np.arange(labels.size), labels], 1e-12, 1.0)
     nll = float(-np.log(p_true).mean())
+    # ECE (15 bins)
     bins = np.linspace(0,1,16); conf = probs.max(1); correct = (preds==labels).astype(np.float32)
     ece=0.0
     for i in range(15):
         lo,hi=bins[i],bins[i+1]
-        m = (conf>lo)&(conf<=hi) if i>0 else (conf>=lo)&(conf<=hi)
-        if m.any(): ece += m.mean()*abs(correct[m].mean()-conf[m].mean())
+        msk = (conf>lo)&(conf<=hi) if i>0 else (conf>=lo)&(conf<=hi)
+        if msk.any(): ece += msk.mean()*abs(correct[msk].mean()-conf[msk].mean())
     return {'acc':acc,'nll':nll,'ece':ece}
 
 # ------------------------------ 主：FS-Alpha（W,b + aug-val） ------------------------------
@@ -632,20 +655,25 @@ if args.do_func_ens and len(swa_snapshots) > 0:
         # 若需要三指标：
         print("[FS-Alpha HeadOnly] (Acc/NLL/ECE) Test:", _eval_full_metrics(headonly_model, loaders['test']))
 
-    # 8) 函数侧集成（ᾱ）：Linear / LogPool
-    # —— 仅最小改动：为 func-ensemble 传入与 HeadOnly 相同的 BN 口径（loaders['train']，aug BN）
+    # 8) 函数侧集成（ᾱ）：Linear / LogPool / Logits（与 HeadOnly 对偶）
     if args.func_type in ('linear','both'):
         res_lin = _eval_function_ensemble_from_alpha_bar(
             swa_snapshots, alpha_bar, loaders['test'], _bm, device,
             mode='linear', bn_loader=loaders['train'], bn_recal=True
         )
-        print(f"[FS-Alpha Func-Ensemble Linear] Test: Acc={res_lin['acc']:.4f} | NLL={res_lin['nll']:.4f} | ECE={res_lin['ece']:.4f}")
+        print(f"[FS-Alpha Func-Ensemble Linear]  Test: Acc={res_lin['acc']:.4f} | NLL={res_lin['nll']:.4f} | ECE={res_lin['ece']:.4f}")
     if args.func_type in ('logpool','both'):
         res_log = _eval_function_ensemble_from_alpha_bar(
             swa_snapshots, alpha_bar, loaders['test'], _bm, device,
             mode='logpool', bn_loader=loaders['train'], bn_recal=True
         )
         print(f"[FS-Alpha Func-Ensemble LogPool]  Test: Acc={res_log['acc']:.4f} | NLL={res_log['nll']:.4f} | ECE={res_log['ece']:.4f}")
+    if args.func_type in ('logits','both'):
+        res_logits = _eval_function_ensemble_from_alpha_bar(
+            swa_snapshots, alpha_bar, loaders['test'], _bm, device,
+            mode='logits', bn_loader=loaders['train'], bn_recal=True
+        )
+        print(f"[FS-Alpha Func-Ensemble Logits ]  Test: Acc={res_logits['acc']:.4f} | NLL={res_logits['nll']:.4f} | ECE={res_logits['ece']:.4f}")
 
 elif args.do_func_ens:
     print("[FS-Alpha] No SWA snapshots were collected; nothing to evaluate.")
