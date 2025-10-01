@@ -516,17 +516,25 @@ def _replace_last_linear(model, last_name, W_mix, b_mix):
     last.weight.copy_(torch.from_numpy(W_mix).to(last.weight.dtype).to(last.weight.device))
     last.bias.copy_(  torch.from_numpy(b_mix).to(last.bias.dtype).to(last.bias.device))
 
+# ====== 仅最小改动：为函数侧集成补齐“每快照 BN 重估”的可选开关 ======
 @torch.no_grad()
-def _eval_function_ensemble_from_alpha_bar(snapshots, alpha_bar, loader, build_model_fn, device, mode='linear'):
+def _eval_function_ensemble_from_alpha_bar(
+    snapshots, alpha_bar, loader, build_model_fn, device, mode='linear',
+    bn_loader=None, bn_recal=False  # <-- 新增：可选 BN 重估
+):
     K = len(snapshots)
     alpha_bar = np.asarray(alpha_bar, dtype=np.float64)
     mix_accum = None
     labels_all = []
     for j in range(K):
-        # 如果是验证集（带增广），固定 RNG；测试集通常无增广，不强制
-        try: _fix_aug_rng()
+        try: _fix_aug_rng()  # 验证集时固定增广；测试集通常无增广
         except Exception: pass
         m = build_model_fn(); m.load_state_dict(snapshots[j], strict=True); m.to(device).eval()
+
+        # ✨ 可选：为每个快照重估 BN（与 HeadOnly 使用同一口径的 loader，例如 loaders['train']）
+        if bn_recal and (bn_loader is not None):
+            utils.bn_update(bn_loader, m)
+
         chunk_list = []
         for x, _ in loader:
             x = x.to(device, non_blocking=True)
@@ -618,18 +626,25 @@ if args.do_func_ens and len(swa_snapshots) > 0:
         headonly_model.load_state_dict((swa_model if args.swa else model).state_dict(), strict=True)
         headonly_model.to(device)
         _replace_last_linear(headonly_model, last_name, W_mix, b_mix)
-        utils.bn_update(loaders['train'], headonly_model)  # 与源码一致
+        utils.bn_update(loaders['train'], headonly_model)  # 与源码一致（aug BN）
         head_res = utils.eval(loaders['test'], headonly_model, criterion, device)
         print(f"[FS-Alpha HeadOnly (W,b on aug-val)] Test Acc: {head_res['accuracy']:.4f}")
         # 若需要三指标：
         print("[FS-Alpha HeadOnly] (Acc/NLL/ECE) Test:", _eval_full_metrics(headonly_model, loaders['test']))
 
     # 8) 函数侧集成（ᾱ）：Linear / LogPool
+    # —— 仅最小改动：为 func-ensemble 传入与 HeadOnly 相同的 BN 口径（loaders['train']，aug BN）
     if args.func_type in ('linear','both'):
-        res_lin = _eval_function_ensemble_from_alpha_bar(swa_snapshots, alpha_bar, loaders['test'], _bm, device, mode='linear')
+        res_lin = _eval_function_ensemble_from_alpha_bar(
+            swa_snapshots, alpha_bar, loaders['test'], _bm, device,
+            mode='linear', bn_loader=loaders['train'], bn_recal=True
+        )
         print(f"[FS-Alpha Func-Ensemble Linear] Test: Acc={res_lin['acc']:.4f} | NLL={res_lin['nll']:.4f} | ECE={res_lin['ece']:.4f}")
     if args.func_type in ('logpool','both'):
-        res_log = _eval_function_ensemble_from_alpha_bar(swa_snapshots, alpha_bar, loaders['test'], _bm, device, mode='logpool')
+        res_log = _eval_function_ensemble_from_alpha_bar(
+            swa_snapshots, alpha_bar, loaders['test'], _bm, device,
+            mode='logpool', bn_loader=loaders['train'], bn_recal=True
+        )
         print(f"[FS-Alpha Func-Ensemble LogPool]  Test: Acc={res_log['acc']:.4f} | NLL={res_log['nll']:.4f} | ECE={res_log['ece']:.4f}")
 
 elif args.do_func_ens:
