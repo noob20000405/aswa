@@ -1,6 +1,3 @@
-按你要求，给你一版**完整、可直接运行**的 `train.py`（已修正你贴子里的缩进/符号错误，保留最小改动；支持 head-only、公平口径的 func-ensemble BN 重估，以及 `linear / logpool / logits` 三种函数侧集成）：
-
-```python
 # train.py
 import argparse
 import os
@@ -680,4 +677,3 @@ if args.do_func_ens and len(swa_snapshots) > 0:
 
 elif args.do_func_ens:
     print("[FS-Alpha] No SWA snapshots were collected; nothing to evaluate.")
-```
