@@ -1,3 +1,6 @@
+按你要求，给你一版**完整、可直接运行**的 `train.py`（已修正你贴子里的缩进/符号错误，保留最小改动；支持 head-only、公平口径的 func-ensemble BN 重估，以及 `linear / logpool / logits` 三种函数侧集成）：
+
+```python
 # train.py
 import argparse
 import os
@@ -46,10 +49,12 @@ parser.add_argument('--val_ratio', type=float, default=0.1, help='validation rat
 # ---------- FS-Alpha：函数侧/权重学习 ----------
 parser.add_argument('--do_func_ens', action='store_true',
                     help='enable function-side ensemble evaluation on SWA snapshots')
-# ✨ 最小扩展：加入 'logits' 选项；默认仍为 'both'，不影响现有脚本
+
+# 最小扩展：加入 'logits' 选项；默认仍为 'both'
 parser.add_argument('--func_type', type=str, default='both',
                     choices=['linear', 'logpool', 'logits', 'both'],
                     help='function-side ensemble type')
+
 parser.add_argument('--func_weights', type=str, default=None,
                     help='optional path to weights (json/npy) for function ensemble; default uniform')
 parser.add_argument('--learn_func_w', action='store_true',
@@ -290,16 +295,16 @@ def _eval_full_metrics(model_, loader_):
     acc = float((probs.argmax(1) == labels).mean())
     nll = float(-np.log(np.clip(probs[np.arange(labels.size), labels], 1e-12, 1.0)).mean())
     # ECE (15 bins)
-    bins = np.linspace(0,1,16)
+    bins = np.linspace(0, 1, 16)
     conf = probs.max(1)
     correct = (probs.argmax(1) == labels).astype(np.float32)
     ece = 0.0
     for i in range(15):
         lo, hi = bins[i], bins[i+1]
-        m = (conf > lo) & (conf <= hi) if i>0 else (conf >= lo) & (conf <= hi)
+        m = (conf > lo) & (conf <= hi) if i > 0 else (conf >= lo) & (conf <= hi)
         if m.any():
             ece += m.mean() * abs(correct[m].mean() - conf[m].mean())
-    return {'acc':acc, 'nll':nll, 'ece':ece}
+    return {'acc': acc, 'nll': nll, 'ece': ece}
 
 utils.bn_update(loaders['train'], model)
 print("Running model Train: ", utils.eval(loaders['train'], model, criterion, device))
@@ -328,7 +333,6 @@ if args.aswa:
     print("ASWA (Acc/NLL/ECE) Test :", _eval_full_metrics(aswa_model, loaders['test']))
 
 # ===================== FS-Alpha (W,b 空间 + aug-val + HAC(QS)) =====================
-
 EVAL_AUG_SEED = 12345  # 保证不同快照看到相同增广
 
 def _fix_aug_rng():
@@ -583,13 +587,13 @@ def _eval_function_ensemble_from_alpha_bar(
     p_true = np.clip(probs[np.arange(labels.size), labels], 1e-12, 1.0)
     nll = float(-np.log(p_true).mean())
     # ECE (15 bins)
-    bins = np.linspace(0,1,16); conf = probs.max(1); correct = (preds==labels).astype(np.float32)
-    ece=0.0
+    bins = np.linspace(0, 1, 16); conf = probs.max(1); correct = (preds == labels).astype(np.float32)
+    ece = 0.0
     for i in range(15):
-        lo,hi=bins[i],bins[i+1]
-        msk = (conf>lo)&(conf<=hi) if i>0 else (conf>=lo)&(conf<=hi)
-        if msk.any(): ece += msk.mean()*abs(correct[msk].mean()-conf[msk].mean())
-    return {'acc':acc,'nll':nll,'ece':ece}
+        lo, hi = bins[i], bins[i+1]
+        msk = (conf > lo) & (conf <= hi) if i > 0 else (conf >= lo) & (conf <= hi)
+        if msk.any(): ece += msk.mean() * abs(correct[msk].mean() - conf[msk].mean())
+    return {'acc': acc, 'nll': nll, 'ece': ece}
 
 # ------------------------------ 主：FS-Alpha（W,b + aug-val） ------------------------------
 if args.do_func_ens and len(swa_snapshots) > 0:
@@ -614,7 +618,7 @@ if args.do_func_ens and len(swa_snapshots) > 0:
     Z_val, last_name = _cache_features_aug_val(body_for_feats, loaders['val'], device)
 
     # 4) 快照的最后线性层堆叠
-    W_stack, b_stack = _stack_last_linear_from_snaps(swa_snapshots, last_name)
+    W_stack, B_stack = _stack_last_linear_from_snaps(swa_snapshots, last_name)
     K, C, D = W_stack.shape
     assert C == num_classes, f"Head classes mismatch: {C} vs {num_classes}"
 
@@ -625,7 +629,7 @@ if args.do_func_ens and len(swa_snapshots) > 0:
     # 6) 在 W,b 空间优化类条件 A
     if args.learn_func_w:
         A = _optimize_alpha_class_conditional_Wb(
-            Z_val, y_val, S_idx, W_stack, b_stack, M_np,
+            Z_val, y_val, S_idx, W_stack, B_stack, M_np,
             steps=args.func_w_steps, lr=args.func_w_lr,
             lam=args.func_w_l2, eta=args.func_w_eta,
             topk=args.func_topk if args.func_topk > 0 else 0,
@@ -633,18 +637,18 @@ if args.do_func_ens and len(swa_snapshots) > 0:
         )
         alpha_bar = A.mean(axis=1).astype(np.float64)
         s = alpha_bar.sum()
-        alpha_bar = (np.ones_like(alpha_bar)/len(alpha_bar)) if (not np.isfinite(s) or s<=1e-12) else (alpha_bar/s)
+        alpha_bar = (np.ones_like(alpha_bar) / len(alpha_bar)) if (not np.isfinite(s) or s <= 1e-12) else (alpha_bar / s)
         print("[FS-Alpha] learned A[K,C] on aug-val; alpha_bar preview:",
               np.round(alpha_bar[:min(10, alpha_bar.size)], 4).tolist())
     else:
         A = None
-        alpha_bar = np.ones(len(swa_snapshots), dtype=np.float64)/float(len(swa_snapshots))
+        alpha_bar = np.ones(len(swa_snapshots), dtype=np.float64) / float(len(swa_snapshots))
         print("[FS-Alpha] use uniform alpha_bar (no A learning).")
 
     # 7) HeadOnly（把 W_mix, b_mix 写回一个拷贝，测试）
     if A is not None:
         W_mix = np.einsum('kc,kcd->cd', A, W_stack)
-        b_mix = np.einsum('kc,kc->c',   A, b_stack)
+        b_mix = np.einsum('kc,kc->c',   A, B_stack)
         headonly_model = build_model()
         headonly_model.load_state_dict((swa_model if args.swa else model).state_dict(), strict=True)
         headonly_model.to(device)
@@ -652,23 +656,22 @@ if args.do_func_ens and len(swa_snapshots) > 0:
         utils.bn_update(loaders['train'], headonly_model)  # 与源码一致（aug BN）
         head_res = utils.eval(loaders['test'], headonly_model, criterion, device)
         print(f"[FS-Alpha HeadOnly (W,b on aug-val)] Test Acc: {head_res['accuracy']:.4f}")
-        # 若需要三指标：
         print("[FS-Alpha HeadOnly] (Acc/NLL/ECE) Test:", _eval_full_metrics(headonly_model, loaders['test']))
 
     # 8) 函数侧集成（ᾱ）：Linear / LogPool / Logits（与 HeadOnly 对偶）
-    if args.func_type in ('linear','both'):
+    if args.func_type in ('linear', 'both'):
         res_lin = _eval_function_ensemble_from_alpha_bar(
             swa_snapshots, alpha_bar, loaders['test'], _bm, device,
             mode='linear', bn_loader=loaders['train'], bn_recal=True
         )
         print(f"[FS-Alpha Func-Ensemble Linear]  Test: Acc={res_lin['acc']:.4f} | NLL={res_lin['nll']:.4f} | ECE={res_lin['ece']:.4f}")
-    if args.func_type in ('logpool','both'):
+    if args.func_type in ('logpool', 'both'):
         res_log = _eval_function_ensemble_from_alpha_bar(
             swa_snapshots, alpha_bar, loaders['test'], _bm, device,
             mode='logpool', bn_loader=loaders['train'], bn_recal=True
         )
         print(f"[FS-Alpha Func-Ensemble LogPool]  Test: Acc={res_log['acc']:.4f} | NLL={res_log['nll']:.4f} | ECE={res_log['ece']:.4f}")
-    if args.func_type in ('logits','both'):
+    if args.func_type in ('logits', 'both'):
         res_logits = _eval_function_ensemble_from_alpha_bar(
             swa_snapshots, alpha_bar, loaders['test'], _bm, device,
             mode='logits', bn_loader=loaders['train'], bn_recal=True
@@ -677,3 +680,4 @@ if args.do_func_ens and len(swa_snapshots) > 0:
 
 elif args.do_func_ens:
     print("[FS-Alpha] No SWA snapshots were collected; nothing to evaluate.")
+```
